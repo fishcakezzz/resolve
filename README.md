@@ -2,7 +2,7 @@
 
 企业售后与订单异常闭环 Agent 平台的**本地可运行演示版**。实现重点是 Parent Case / Subcase、证据版本、确定性策略、人工审批、整案预算约束、事务 Outbox 与幂等执行。产品目标和完整需求见 [PRD](ResolveFlow_PRD.md)。
 
-## 已落地的流程
+## Agent流程
 
 1. 创建主 Case，拆成多个带依赖关系的 Subcase。
 2. 导入本地模拟的 CRM / OMS / Payment / Logistics / Knowledge 证据，或调用可配置的只读 HTTP 证据适配器；保存来源与版本，标记跨来源冲突。
@@ -13,9 +13,6 @@
 7. 独立 Worker 幂等执行模拟退款/补发；所有必需 Subcase 成功后主 Case 才结束。
 8. 提供 Case、证据、时间线和执行结果查询接口。
 
-## 当前边界
-
-这是可演示的后端核心切片。已提供通用证据 HTTP 适配协议和可选模型接口，但真实 CRM / OMS / 支付 / 物流系统的字段映射与凭证尚未接入。LangGraph 持久化 Checkpointer、Redis、OpenTelemetry / Langfuse、企业鉴权、前端操作台和生产级部署也尚未接入。`demo_facts` 与 `DemoAction` 是本地模拟数据及模拟外部动作，**不能用于真实资金操作**。简历中的准确率、延迟和恢复率未在这个新仓库复测。
 
 ## 本地运行
 
