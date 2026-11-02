@@ -1,6 +1,6 @@
 # ResolveFlow
 
-企业售后与订单异常闭环 Agent 平台的**本地可运行演示版**。实现重点是 Parent Case / Subcase、证据版本、确定性策略、人工审批、整案预算约束、事务 Outbox 与幂等执行。产品目标和完整需求见 [PRD](ResolveFlow_PRD.md)。
+ResolveFlow 是面向企业售后与订单异常的 Agent 平台。它将复杂诉求拆解为相互关联的 Subcase，围绕证据、策略、审批和执行结果形成可追踪的处理闭环。项目设计见 [PRD](ResolveFlow_PRD.md)。
 
 ## Agent流程
 
@@ -12,7 +12,6 @@
 6. 执行前检查 Subcase 依赖、整案累计退款和重复补发，再在同一数据库事务中写入 Outbox。
 7. 独立 Worker 幂等执行模拟退款/补发；所有必需 Subcase 成功后主 Case 才结束。
 8. 提供 Case、证据、时间线和执行结果查询接口。
-
 
 ## 本地运行
 
@@ -30,7 +29,9 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m resolveflow.worker
 ```
 
-默认使用当前目录的 SQLite 数据库。API 文档位于 `http://127.0.0.1:8000/docs`。如果已安装 Docker，先将 `.env.example` 复制为 `.env`，设置 URL 安全的 `RESOLVE_POSTGRES_PASSWORD`，再运行 `docker compose up --build`；这会使用 PostgreSQL 和独立 Worker。本次开发环境未提供 Docker，因此 Compose 尚未实测。
+默认使用当前目录的 SQLite 数据库。API 文档位于 `http://127.0.0.1:8000/docs`。若使用 Docker，先将 `.env.example` 复制为 `.env`，设置 URL 安全的 `RESOLVE_POSTGRES_PASSWORD`，再运行 `docker compose up --build`；Compose 配置包含 PostgreSQL、API 服务和独立 Worker。
+
+示例请求中的 `demo_facts` 和 Worker 使用的 `DemoAction` 用于本地流程演示。接入真实业务系统时，需要按企业接口协议实现证据查询及退款、补发执行适配器。
 
 ### 可选外部接口
 
