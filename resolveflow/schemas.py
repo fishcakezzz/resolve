@@ -75,3 +75,8 @@ class ApprovalIn(BaseModel):
 
 class ExecuteIn(BaseModel):
     expected_case_version: int = Field(ge=1)
+
+
+class TakeoverIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
+    issue_keys: list[str] = Field(default_factory=list)

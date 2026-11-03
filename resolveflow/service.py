@@ -1,12 +1,13 @@
 import hashlib
 import json
 
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from .agents.graph import analysis_graph
+from .agents.graph import durable_graph
 from .llm import LLMError
-from .models import Approval, Case, Event, Evidence, Execution, Outbox, PolicyDecision, Proposal, Subcase, now
+from .observability import tracer
+from .models import AgentTask, InvestigationResult, ResolutionPlan, WorkflowCheckpoint, CaseTakeover, Approval, Case, Event, Evidence, Execution, Outbox, PolicyDecision, Proposal, Subcase, now
 from .policy import POLICY_VERSION, evaluate, required_evidence
 from .schemas import ApprovalIn, CaseCreate, EvidenceUpdate
 
@@ -65,6 +66,35 @@ def validate_fact(field: str, value: object) -> None:
     elif field == "logistics_status":
         if not isinstance(value, str) or not value:
             raise DomainError("logistics_status 必须是非空字符串", 422)
+    elif field in ("order_items", "fulfillments"):
+        if not isinstance(value, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("sku"), str) or not row["sku"]
+            or isinstance(row.get("quantity"), bool) or not isinstance(row.get("quantity"), int)
+            or row["quantity"] < 0 for row in value
+        ):
+            raise DomainError(f"{field} 必须包含 SKU 和非负整数数量", 422)
+    elif field == "payment_transactions":
+        if not isinstance(value, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("transaction_id"), str)
+            or not row["transaction_id"] or row.get("status") not in ("SUCCEEDED", "FAILED", "PENDING")
+            for row in value
+        ):
+            raise DomainError("payment_transactions 格式无效", 422)
+    elif field == "refund_transactions":
+        if not isinstance(value, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("refund_id"), str)
+            or not row["refund_id"] or row.get("status") not in ("SUCCEEDED", "FAILED", "PENDING")
+            or isinstance(row.get("amount_cents"), bool) or not isinstance(row.get("amount_cents"), int)
+            or row["amount_cents"] < 0 for row in value
+        ):
+            raise DomainError("refund_transactions 格式无效", 422)
+    elif field == "packages":
+        if not isinstance(value, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("package_id"), str)
+            or not row["package_id"] or row.get("status") not in ("IN_TRANSIT", "LATE", "DELIVERED", "LOST")
+            for row in value
+        ):
+            raise DomainError("packages 格式无效", 422)
 
 
 def create_case(db: Session, data: CaseCreate) -> Case:
@@ -170,26 +200,57 @@ def analyze(db: Session, case_id: str) -> Case:
         for row in db.scalars(select(Evidence).where(Evidence.case_id == case_id, Evidence.status == "VALID"))
     }
     try:
-        agent_result = analysis_graph.invoke({
-            "case_id": case_id,
-            "evidence_version": item.evidence_version,
-            "issues": [
-                {"key": subcase.key, "issue_type": subcase.issue_type, "requested_amount_cents": subcase.requested_amount_cents, "sku": subcase.sku}
-                for subcase in pending
-            ],
-            "facts": facts,
-            "evidence_refs": evidence_refs,
-        })
+        with tracer.start_as_current_span("case.analyze", attributes={"case.id": case_id, "evidence.version": item.evidence_version}), durable_graph() as graph:
+            agent_result = graph.invoke({
+                "case_id": case_id,
+                "order_id": item.order_id,
+                "evidence_version": item.evidence_version,
+                "issues": [
+                    {"key": subcase.key, "issue_type": subcase.issue_type, "requested_amount_cents": subcase.requested_amount_cents, "sku": subcase.sku}
+                    for subcase in pending
+                ],
+                "facts": facts,
+                "evidence_refs": evidence_refs,
+            }, config={"configurable": {"thread_id": f"{case_id}:{item.evidence_version}"}})
     except LLMError as exc:
         raise DomainError(str(exc), 502) from exc
+    checkpoint = db.get(WorkflowCheckpoint, case_id)
+    if checkpoint is None:
+        checkpoint = WorkflowCheckpoint(case_id=case_id, evidence_version=item.evidence_version,
+                                        stage="ANALYZING", pending_issue_keys=[], missing_fields=[])
+        db.add(checkpoint)
+    checkpoint.evidence_version = item.evidence_version
+    checkpoint.pending_issue_keys = [subcase.key for subcase in pending]
+    checkpoint.missing_fields = agent_result["review"]["missing_fields"]
+    checkpoint.stage = ("TAKEOVER_REQUIRED" if agent_result["review"]["status"] == "BLOCKED"
+                        else "AWAITING_EVIDENCE" if checkpoint.missing_fields else "PLAN_READY")
     event(db, case_id, "AGENT_COORDINATOR_DISPATCHED", {"issue_keys": [subcase.key for subcase in pending], "task_ids": [task["task_id"] for task in agent_result["tasks"]]})
     for task in agent_result["tasks"]:
+        db.add(AgentTask(id=task["task_id"], case_id=case_id, role=task["role"],
+                         issue_keys=task["issue_keys"], objective=task["objective"],
+                         order_ref=task["order_ref"], evidence_version=task["evidence_version"],
+                         tool_scope=task["allowed_fields"], status="DISPATCHED"))
         event(db, case_id, "AGENT_TASK_DISPATCHED", {"task_id": task["task_id"], "role": task["role"], "issue_keys": task["issue_keys"], "evidence_version": task["evidence_version"]})
     for role_key in ("fulfillment_result", "payment_result"):
         result = agent_result[role_key]
         if result["status"] != "SKIPPED":
+            task = db.get(AgentTask, result["task_id"])
+            task.status = result["status"]
+            db.add(InvestigationResult(task_id=result["task_id"], case_id=case_id,
+                                       status=result["status"], findings=result["findings"],
+                                       missing_fields=result["missing_fields"], conflicts=result["conflicts"],
+                                       next_action=result["next_action"]))
             event(db, case_id, "AGENT_INVESTIGATION_COMPLETED", result)
+    event(db, case_id, "AGENT_COORDINATOR_REVIEWED", agent_result["review"])
+    previous_plan = db.scalar(select(ResolutionPlan).where(ResolutionPlan.case_id == case_id).order_by(ResolutionPlan.version.desc()))
+    stored_plan = ResolutionPlan(case_id=case_id, version=previous_plan.version + 1 if previous_plan else 1,
+                                 evidence_version=item.evidence_version, status=agent_result["plan"]["status"],
+                                 actions=agent_result["plan"]["actions"], blockers=agent_result["plan"]["blockers"])
+    db.add(stored_plan)
     planned_ids = []
+    findings_by_key = {finding["issue_key"]: finding
+                       for role_key in ("fulfillment_result", "payment_result")
+                       for finding in agent_result[role_key].get("findings", [])}
     for subcase in pending:
         current = latest_proposal(db, subcase.id)
         result = agent_result["proposals"][subcase.key]
@@ -206,6 +267,11 @@ def analyze(db: Session, case_id: str) -> Case:
         db.flush()
         planned_ids.append(proposal.id)
         decision, reasons = evaluate(item, subcase, proposal, facts)
+        finding = findings_by_key[subcase.key]
+        if finding["conflicts"]:
+            decision, reasons = "BLOCKED", ["调查证据互相冲突: " + ", ".join(finding["conflicts"])]
+        elif finding["conclusion"] == "UNKNOWN":
+            decision, reasons = "NEEDS_INFO", ["调查结论未知，需补充证据"]
         db.add(
             PolicyDecision(
                 proposal_id=proposal.id,
@@ -215,10 +281,23 @@ def analyze(db: Session, case_id: str) -> Case:
                 evidence_version=item.evidence_version,
             )
         )
-        proposal.status = {"ALLOW": "READY", "REVIEW": "PENDING_APPROVAL", "DENY": "DENIED", "NEEDS_INFO": "NEEDS_INFO"}[decision]
+        proposal.status = {"ALLOW": "READY", "REVIEW": "PENDING_APPROVAL", "DENY": "DENIED", "NEEDS_INFO": "NEEDS_INFO", "BLOCKED": "NEEDS_REVIEW"}[decision]
         subcase.status = proposal.status
         event(db, case_id, "PROPOSAL_EVALUATED", {"proposal_id": proposal.id, "decision": decision, "reasons": reasons}, subcase.id)
-    event(db, case_id, "AGENT_PLAN_PROPOSED", {"proposal_ids": planned_ids, "evidence_version": item.evidence_version})
+    db.flush()
+    preview = case_plan(db, case_id)
+    stored_plan.actions = [{**action,
+                            "finding": findings_by_key.get(action["subcase_key"], {}).get("conclusion")}
+                           for action in preview["actions"]]
+    action_blockers = [f"{action['subcase_key']}: {reason}" for action in preview["actions"]
+                       for reason in action["blockers"]]
+    stored_plan.blockers = list(dict.fromkeys(stored_plan.blockers + preview["global_blockers"] + action_blockers))
+    if stored_plan.blockers:
+        stored_plan.status = "BLOCKED"
+        if checkpoint.stage == "PLAN_READY":
+            checkpoint.stage = "PLAN_BLOCKED"
+    event(db, case_id, "AGENT_PLAN_PROPOSED", {"proposal_ids": planned_ids, "plan_id": stored_plan.id,
+                                              "evidence_version": item.evidence_version, "blockers": stored_plan.blockers})
     refresh_case_status(db, item)
     return item
 
@@ -314,13 +393,37 @@ def case_plan(db: Session, case_id: str) -> dict:
     available = max(0, int(facts["order_total_cents"]) - int(facts["refunded_cents"])) if required.issubset(facts) else None
     if available is not None and total_refunds > available:
         global_blockers.append("整案累计退款超过可退余额")
+    other_refunds = db.scalar(
+        select(func.coalesce(func.sum(Proposal.amount_cents), 0))
+        .join(Subcase, Proposal.subcase_id == Subcase.id)
+        .join(Case, Subcase.case_id == Case.id)
+        .where(Case.order_id == item.order_id, Case.id != item.id,
+               Proposal.action_type == "REFUND",
+               Proposal.status.in_(("QUEUED", "EXECUTING", "SUCCEEDED")))
+    ) or 0
+    if available is not None and total_refunds + other_refunds > available:
+        global_blockers.append("跨 Case 累计退款超过订单可退余额")
     reships = [p.sku for p in active if p.action_type == "RESHIP"]
     if len(reships) != len(set(reships)):
         global_blockers.append("整案存在同一 SKU 的重复补发")
     refund_skus = {p.sku for p in active if p.action_type == "REFUND" and p.sku}
     if refund_skus.intersection(reships):
         global_blockers.append("整案存在同一 SKU 的退款与补发冲突")
+    other_reships = set(db.scalars(
+        select(Proposal.sku).join(Subcase, Proposal.subcase_id == Subcase.id)
+        .join(Case, Subcase.case_id == Case.id)
+        .where(Case.order_id == item.order_id, Case.id != item.id,
+               Proposal.action_type == "RESHIP", Proposal.sku.is_not(None),
+               Proposal.status.in_(("QUEUED", "EXECUTING", "SUCCEEDED")))
+    ))
+    if other_reships.intersection(reships):
+        global_blockers.append("跨 Case 存在同一 SKU 的重复补发")
+    if other_reships.intersection(refund_skus):
+        global_blockers.append("跨 Case 存在同一 SKU 的退款与补发冲突")
     ready_keys = [action["subcase_key"] for action in actions if action["ready_now"]]
+    takeover = db.get(CaseTakeover, case_id)
+    if takeover and takeover.status == "ACTIVE" and (not takeover.issue_keys or set(ready_keys) & set(takeover.issue_keys)):
+        global_blockers.append("人工接管范围内的动作已冻结")
     return {
         "case_id": case_id,
         "case_version": item.version,
@@ -328,6 +431,7 @@ def case_plan(db: Session, case_id: str) -> dict:
         "actions": actions,
         "total_refund_cents": total_refunds,
         "available_refund_cents": available,
+        "other_case_refund_cents": other_refunds,
         "global_blockers": global_blockers,
         "ready_now": ready_keys,
         "can_execute_now": bool(ready_keys) and not global_blockers,
@@ -396,9 +500,14 @@ def closure_proof(db: Session, case_id: str) -> dict:
 
 def queue_actions(db: Session, case_id: str, expected_version: int) -> int:
     item = get_case(db, case_id)
+    if db.bind.dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:order_ref))"), {"order_ref": item.order_id})
     if item.version != expected_version:
         raise DomainError("Case 版本已变化，请刷新后重试")
     snapshot = case_plan(db, case_id)
+    takeover = db.get(CaseTakeover, case_id)
+    if takeover and takeover.status == "ACTIVE" and (not takeover.issue_keys or set(snapshot["ready_now"]) & set(takeover.issue_keys)):
+        raise DomainError("人工接管范围内的动作已冻结")
     if snapshot["global_blockers"]:
         raise DomainError(snapshot["global_blockers"][0])
     if not snapshot["ready_now"]:

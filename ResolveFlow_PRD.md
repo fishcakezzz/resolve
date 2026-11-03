@@ -177,13 +177,14 @@ flowchart TD
 - 仅当所有 Subcase 成功、关键证据有效且版本匹配、策略及审批有效、Outbox 完成、执行回执确认时，`verified=true`；结案状态变化记录 `CASE_CLOSED` 事件。
 - **验收**：部分成功时证明未通过；所有模拟动作成功后通过；证据失效或回执缺失时不通过。证明是系统记录的一致性核对，不等同于真实支付或物流系统的法律凭证。
 
-### FR-12 四角色 Agent 编排（演示版已部分落地）
+### FR-12 四角色 Agent 编排（已实现任务与结果持久化）
 
 - Case Coordinator 负责自然语言拆案草稿和已确认问题的调查派发；Fulfillment Investigator 与 Payment Investigator 各自在授权字段内调查履约和资金证据；Resolution Planner 汇总共享证据并形成候选动作。
-- 任务包含 `task_id`、目标问题、证据版本、允许字段和最大步数；两类调查任务在 LangGraph 中并行运行，结果按角色回到方案节点。调查角色的只读工具由代码执行字段权限检查，模型不能扩大读取范围。
-- 未配置模型时使用确定性选择逻辑；配置模型时，拆案、调查字段选择和方案建议可使用兼容 Chat Completions 的接口，所有输出仍需 Schema、策略及整案规则校验。任务和结果写入 Case 时间线。
+- 任务包含 `case_id`、`task_id`、目标问题、订单引用、证据版本、允许字段和最大步数；两类调查任务在 LangGraph 中并行运行，Coordinator 汇总缺口与冲突后交给 Planner。调查结论区分 `CONFIRMED`、`REFUTED`、`UNKNOWN`。
+- 未配置模型时使用确定性选择逻辑；配置模型时，拆案、调查字段选择和方案建议可使用兼容 Chat Completions 的接口。任务、结果、整案计划版本和业务恢复检查点写入数据库，时间线同步记录关键事件。
 - **验收**：缺件与延误交履约调查，重复扣款交资金调查；跨角色字段访问被拒绝；调查结果有证据引用和缺失字段；模型的越权查询或非法候选动作不能进入执行队列。
-- **后续工作**：按需调用真实业务查询工具、多轮补查任务持久化、Planner 生成完整的联合方案、LangGraph Checkpointer 与跨请求图恢复。
+- **已实现的恢复与执行约束**：证据变化后可从业务检查点重新分析；人工接管冻结指定问题或整案动作；Worker 可接入幂等 HTTP 动作接口并在重试前查询结果；同订单跨 Case 退款纳入执行前预算。
+- **继续建设**：按交易和包裹标识按需查询、多轮任务派发、联合候选方案与替代方案、LangGraph `interrupt()` 式节点内继续、企业身份集成和完整分布式追踪。
 
 ## 6. 数据模型建议
 
@@ -200,6 +201,9 @@ flowchart TD
 | `subcases`（首版已落地） | `id`, `case_id`, `key`, `issue_type`, `status`, `depends_on`, `version` | 问题级状态与依赖；目标/负责人/完成规则尚待扩展 |
 | `subcase_links`（规划） | `source_subcase_id`, `target_subcase_id`, `relation_type` | 显式依赖、互斥等关系；首版依赖保存在 Subcase 字段中 |
 | `evidence_links`（规划） | `evidence_id`, `subcase_id`, `evidence_version` | 字段级证据依赖；首版采用 Case 级证据版本失效 |
+| `agent_tasks`、`investigation_results` | 任务范围、状态、结论、缺口、证据引用 | 记录专业 Agent 调查过程 |
+| `resolution_plans`、`workflow_checkpoints` | 计划版本、阻断项、恢复阶段 | 保存整案分析与跨请求恢复进度 |
+| `case_takeovers` | 操作员、范围、原因、状态 | 冻结与解除人工接管范围 |
 
 
 
@@ -220,6 +224,9 @@ flowchart TD
 | `/api/case-drafts` | `POST` | 根据原始诉求生成待确认的 Subcase 草稿 |
 | `/api/cases/{id}/plan` | `GET` | 查询整案动作、依赖、预算和阻塞原因 |
 | `/api/cases/{id}/closure-proof` | `GET` | 查询逐问题结案核对结果与证据、回执引用 |
+| `/api/cases/{id}/workflow` | `GET` | 查询检查点、任务、调查结果和整案计划历史 |
+| `/api/cases/{id}/resume` | `POST` | 证据补齐后重新分析未决问题 |
+| `/api/cases/{id}/takeover`、`/release` | `POST` | 操作员接管和解除动作冻结 |
 
 补充信息、历史方案列表和审批队列接口随持久化编排与操作台迭代设计。
 
@@ -232,11 +239,12 @@ flowchart TD
 | 层次 | 技术 | 在项目中的职责 |
 | --- | --- | --- |
 | 语言与 API | Python、FastAPI | 对外 API、业务服务与异步接口 |
-| Agent 编排 | LangGraph | 四角色分析流程与并行调查分支 |
+| Agent 编排 | LangGraph、SQLite/PostgreSQL Checkpointer | 四角色分析、并行调查与节点状态持久化 |
 | 数据库 | SQLite、PostgreSQL、SQLAlchemy | 本地运行使用 SQLite；Docker Compose 使用 PostgreSQL，保存 Case、证据、审批、Outbox 和执行状态 |
 | 模型与外部接口 | 兼容 Chat Completions 的 HTTP 接口、httpx | 可配置模型调用和五类只读证据接口 |
 | 数据校验 | Pydantic | 请求、拆案草稿、模型输出与工具选择校验 |
-| 异步执行 | 独立 Python Worker | 轮询 Outbox，幂等执行模拟业务动作 |
+| 异步执行 | 独立 Python Worker | 轮询 Outbox，执行模拟动作或可配置的幂等 HTTP 动作并核查状态 |
+| 可观测性 | OpenTelemetry SDK、OTLP HTTP 导出 | 分析与动作执行 Span；配置 Collector 后导出 |
 | 部署与测试 | Docker Compose、pytest | 本地服务编排与自动化验证 |
 
 
@@ -244,11 +252,11 @@ flowchart TD
 
 | 能力 | 选型方向 | 用途 |
 | --- | --- | --- |
-| 图状态持久化 | LangGraph Checkpointer | 缺失信息追问、审批等待和跨请求图恢复 |
+| 图内暂停与恢复 | LangGraph `interrupt()` | 在同一图线程内等待补证或审批后继续 |
 | 数据迁移 | Alembic | 数据表结构演进 |
 | 缓存与协调 | Redis，按实际负载确定用途 | 缓存或短期任务协调 |
-| 可观测性 | OpenTelemetry、Langfuse | 跨组件 Trace、模型调用与评测 |
-| 外部系统访问 | 真实业务适配器、退避重试、熔断与结果核查 | 接入企业接口并处理结果未知状态 |
+| 可观测性深化 | Langfuse、完整 Trace 传播 | 模型调用、工具调用与离线评测关联 |
+| 外部系统访问 | 领域化只读适配器、退避重试与熔断 | 按订单、交易和包裹标识逐步查询企业接口 |
 | 身份与权限 | 企业 SSO/OIDC、角色权限、审批权限隔离 | 控制 Case 查询与业务操作范围 |
 | 测试与交付 | 离线 Case 数据集、故障注入、CI、密钥管理 | 持续验证质量与可靠性 |
 | 可视化操作台 | Web 前端框架待选 | 展示 CaseGraph、整案计划和审批队列 |

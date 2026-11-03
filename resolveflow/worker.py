@@ -6,7 +6,9 @@ from datetime import timedelta
 from sqlalchemy import and_, or_, select, update
 
 from .db import transaction
-from .models import Case, DemoAction, Evidence, Execution, Outbox, Proposal, Subcase, now
+from .action_adapter import configured, execute_action, query_action
+from .observability import configure_telemetry, tracer
+from .models import Case, CaseTakeover, DemoAction, Evidence, Execution, Outbox, Proposal, Subcase, now
 from .service import event, refresh_case_status
 
 
@@ -54,6 +56,11 @@ def process_one() -> bool:
         proposal = db.get(Proposal, outbox.proposal_id)
         subcase = db.get(Subcase, proposal.subcase_id)
         case = db.get(Case, subcase.case_id)
+        takeover = db.get(CaseTakeover, case.id)
+        if takeover and takeover.status == "ACTIVE" and (not takeover.issue_keys or subcase.key in takeover.issue_keys):
+            outbox.status = "FROZEN"
+            event(db, case.id, "ACTION_FROZEN", {"proposal_id": proposal.id}, subcase.id)
+            return True
         if proposal.status not in ("QUEUED", "EXECUTING") or proposal.evidence_version != case.evidence_version:
             outbox.status = "CANCELLED"
             event(db, case.id, "ACTION_CANCELLED_STALE", {"proposal_id": proposal.id}, subcase.id)
@@ -85,7 +92,8 @@ def process_one() -> bool:
         sku = proposal.sku
 
     try:
-        external_ref = _demo_external_action(idempotency_key, action_type, order_id, amount_cents, sku)
+        with tracer.start_as_current_span("action.execute", attributes={"case.id": case.id, "action.type": action_type}):
+            external_ref = (query_action(idempotency_key) or execute_action(idempotency_key, action_type, order_id, amount_cents, sku)) if configured() else _demo_external_action(idempotency_key, action_type, order_id, amount_cents, sku)
     except Exception as exc:
         with transaction() as db:
             outbox = db.get(Outbox, outbox_id)
@@ -119,6 +127,7 @@ def process_one() -> bool:
 def main() -> None:
     from .db import init_db
 
+    configure_telemetry("resolveflow-worker")
     init_db()
     while True:
         if not process_one():

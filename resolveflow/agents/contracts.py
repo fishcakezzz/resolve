@@ -5,6 +5,7 @@ from typing import Any, TypedDict
 
 class AgentState(TypedDict, total=False):
     case_id: str
+    order_id: str
     evidence_version: int
     issues: list[dict[str, Any]]
     facts: dict[str, Any]
@@ -12,6 +13,8 @@ class AgentState(TypedDict, total=False):
     tasks: list[dict[str, Any]]
     fulfillment_result: dict[str, Any]
     payment_result: dict[str, Any]
+    review: dict[str, Any]
+    plan: dict[str, Any]
     proposals: dict[str, dict[str, Any]]
 
 

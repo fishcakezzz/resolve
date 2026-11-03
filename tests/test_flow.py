@@ -43,7 +43,7 @@ def create(client, request_key, issues, facts=None):
         json={
             "request_key": request_key,
             "customer_id": "customer-1",
-            "order_id": "order-1",
+            "order_id": f"order-{request_key}",
             "issues": issues,
             "demo_facts": facts if facts is not None else base_facts(),
         },
@@ -182,7 +182,7 @@ def test_worker_recovers_after_external_success_before_receipt(monkeypatch):
         assert process_one() is True
         assert client.get(f"/api/cases/{case_id}").json()["status"] == "SUCCEEDED"
         with transaction() as db:
-            assert db.scalar(select(func.count()).select_from(DemoAction).where(DemoAction.order_id == "order-1", DemoAction.sku == "SKU-CRASH")) == 1
+            assert db.scalar(select(func.count()).select_from(DemoAction).where(DemoAction.order_id == "order-crash-1", DemoAction.sku == "SKU-CRASH")) == 1
 
 
 def test_conflicting_source_invalidates_existing_proposal(monkeypatch):
@@ -369,3 +369,106 @@ def test_model_investigator_cannot_read_other_roles_evidence(monkeypatch):
         refused = client.post(f"/api/cases/{case['id']}/analyze")
         assert refused.status_code == 502
         assert client.get(f"/api/cases/{case['id']}").json()["subcases"][0]["proposal"] is None
+
+
+def test_persisted_tasks_findings_and_resume_after_new_evidence():
+    with TestClient(app) as client:
+        facts = base_facts()
+        facts.pop("duplicate_charge_confirmed")
+        case = create(client, "resume-contract-1", [
+            {"key": "missing", "issue_type": "MISSING_ITEM", "sku": "SKU-R"},
+            {"key": "double", "issue_type": "DUPLICATE_CHARGE", "requested_amount_cents": 1000},
+        ], facts)
+        case_id = case["id"]
+        client.post(f"/api/cases/{case_id}/analyze")
+        workflow = client.get(f"/api/cases/{case_id}/workflow").json()
+        assert workflow["checkpoint"]["stage"] == "AWAITING_EVIDENCE"
+        assert workflow["checkpoint"]["missing_fields"] == ["duplicate_charge_confirmed"]
+        assert {task["role"] for task in workflow["tasks"]} == {"fulfillment_investigator", "payment_investigator"}
+        assert {finding["conclusion"] for task in workflow["tasks"] for finding in task["result"]["findings"]} == {"CONFIRMED", "UNKNOWN"}
+        assert client.post(f"/api/cases/{case_id}/resume").status_code == 409
+        client.put(f"/api/cases/{case_id}/evidence/duplicate_charge_confirmed", json=fact(True, "PAYMENT"))
+        assert client.post(f"/api/cases/{case_id}/resume").status_code == 200
+        resumed = client.get(f"/api/cases/{case_id}/workflow").json()
+        assert resumed["checkpoint"]["stage"] == "PLAN_READY"
+        assert [plan["version"] for plan in resumed["plans"]] == [1, 2]
+        assert resumed["plans"][-1]["status"] == "PROPOSED"
+        from resolveflow.agents.graph import durable_graph
+        evidence_version = client.get(f"/api/cases/{case_id}").json()["evidence_version"]
+        with durable_graph() as graph:
+            state = graph.get_state({"configurable": {"thread_id": f"{case_id}:{evidence_version}"}})
+        assert state.values["plan"]["status"] == "PROPOSED"
+
+
+def test_structured_payment_conflict_blocks_refund():
+    with TestClient(app) as client:
+        facts = base_facts()
+        facts["payment_transactions"] = fact([
+            {"transaction_id": "tx-1", "status": "SUCCEEDED"},
+        ], "PAYMENT")
+        case = create(client, "payment-conflict-1", [
+            {"key": "double", "issue_type": "DUPLICATE_CHARGE", "requested_amount_cents": 1000},
+        ], facts)
+        case_id = case["id"]
+        current = client.post(f"/api/cases/{case_id}/analyze").json()
+        assert current["subcases"][0]["status"] == "NEEDS_REVIEW"
+        workflow = client.get(f"/api/cases/{case_id}/workflow").json()
+        assert workflow["tasks"][0]["result"]["findings"][0]["conclusion"] == "UNKNOWN"
+        assert workflow["tasks"][0]["result"]["conflicts"] == ["duplicate_charge_confirmed"]
+        assert client.post(f"/api/cases/{case_id}/execute", json={"expected_case_version": current["version"]}).status_code == 409
+
+
+def test_cross_case_order_refund_budget():
+    with TestClient(app) as client:
+        first = create(client, "shared-order-a", [{"key": "late", "issue_type": "LATE_DELIVERY", "requested_amount_cents": 7000}])
+        second = create(client, "shared-order-b", [{"key": "late", "issue_type": "LATE_DELIVERY", "requested_amount_cents": 7000}])
+        from resolveflow.db import transaction
+        from resolveflow.models import Case
+        with transaction() as db:
+            db.get(Case, second["id"]).order_id = f"order-shared-order-a"
+        a = client.post(f"/api/cases/{first['id']}/analyze").json()
+        b = client.post(f"/api/cases/{second['id']}/analyze").json()
+        client.post(f"/api/cases/{first['id']}/subcases/late/approval", json={"approver_id": "manager-1", "decision": "APPROVE"})
+        client.post(f"/api/cases/{second['id']}/subcases/late/approval", json={"approver_id": "manager-1", "decision": "APPROVE"})
+        a = client.get(f"/api/cases/{first['id']}").json()
+        b = client.get(f"/api/cases/{second['id']}").json()
+        assert client.post(f"/api/cases/{first['id']}/execute", json={"expected_case_version": a["version"]}).status_code == 200
+        plan = client.get(f"/api/cases/{second['id']}/plan").json()
+        assert plan["other_case_refund_cents"] == 7000
+        assert "跨 Case 累计退款超过订单可退余额" in plan["global_blockers"]
+        assert client.post(f"/api/cases/{second['id']}/execute", json={"expected_case_version": b["version"]}).status_code == 409
+        assert process_one() is True
+
+
+def test_operator_takeover_freezes_queued_action_until_release(monkeypatch):
+    monkeypatch.setenv("RESOLVE_OPERATOR_TOKEN", "test-operator-secret")
+    monkeypatch.setenv("RESOLVE_OPERATOR_ID", "operator-1")
+    headers = {"X-Operator-Token": "test-operator-secret"}
+    with TestClient(app) as client:
+        case = create(client, "takeover-1", [{"key": "missing", "issue_type": "MISSING_ITEM", "sku": "SKU-T"}])
+        case_id = case["id"]
+        ready = client.post(f"/api/cases/{case_id}/analyze").json()
+        assert client.post(f"/api/cases/{case_id}/execute", json={"expected_case_version": ready["version"]}).status_code == 200
+        assert client.post(f"/api/cases/{case_id}/takeover", json={"reason": "人工核查"}).status_code == 403
+        assert client.post(f"/api/cases/{case_id}/takeover", json={"reason": "人工核查"}, headers=headers).status_code == 200
+        assert process_one() is False
+        assert client.post(f"/api/cases/{case_id}/release", headers=headers).status_code == 200
+        assert process_one() is True
+        assert client.get(f"/api/cases/{case_id}").json()["status"] == "SUCCEEDED"
+
+
+def test_external_status_is_queried_before_replay(monkeypatch):
+    monkeypatch.setenv("RESOLVE_ACTION_API_URL", "https://actions.example.test/execute")
+    monkeypatch.setenv("RESOLVE_ACTION_STATUS_URL", "https://actions.example.test/status")
+    monkeypatch.setattr(worker_module, "query_action", lambda key: "receipt-existing")
+    def unexpected_execute(*args):
+        raise AssertionError("已确认外部结果时不得再次发起动作")
+    monkeypatch.setattr(worker_module, "execute_action", unexpected_execute)
+    with TestClient(app) as client:
+        case = create(client, "external-query-1", [{"key": "missing", "issue_type": "MISSING_ITEM", "sku": "SKU-E"}])
+        case_id = case["id"]
+        ready = client.post(f"/api/cases/{case_id}/analyze").json()
+        client.post(f"/api/cases/{case_id}/execute", json={"expected_case_version": ready["version"]})
+        assert process_one() is True
+        executions = client.get(f"/api/cases/{case_id}/executions").json()
+        assert executions[0]["external_ref"] == "receipt-existing"

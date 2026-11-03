@@ -149,3 +149,67 @@ class DemoAction(Base):
     amount_cents: Mapped[int] = mapped_column(Integer, default=0)
     sku: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AgentTask(Base):
+    __tablename__ = "agent_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    role: Mapped[str] = mapped_column(String(50))
+    issue_keys: Mapped[list] = mapped_column(JSON)
+    objective: Mapped[str] = mapped_column(Text)
+    order_ref: Mapped[str] = mapped_column(String(120))
+    evidence_version: Mapped[int] = mapped_column(Integer)
+    tool_scope: Mapped[list] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(30), default="DISPATCHED")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class InvestigationResult(Base):
+    __tablename__ = "investigation_results"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(ForeignKey("agent_tasks.id"), unique=True)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    status: Mapped[str] = mapped_column(String(30))
+    findings: Mapped[list] = mapped_column(JSON)
+    missing_fields: Mapped[list] = mapped_column(JSON)
+    conflicts: Mapped[list] = mapped_column(JSON)
+    next_action: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ResolutionPlan(Base):
+    __tablename__ = "resolution_plans"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    evidence_version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(30))
+    actions: Mapped[list] = mapped_column(JSON)
+    blockers: Mapped[list] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class WorkflowCheckpoint(Base):
+    __tablename__ = "workflow_checkpoints"
+
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), primary_key=True)
+    evidence_version: Mapped[int] = mapped_column(Integer)
+    stage: Mapped[str] = mapped_column(String(40))
+    pending_issue_keys: Mapped[list] = mapped_column(JSON)
+    missing_fields: Mapped[list] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+class CaseTakeover(Base):
+    __tablename__ = "case_takeovers"
+
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), primary_key=True)
+    operator_id: Mapped[str] = mapped_column(String(120))
+    reason: Mapped[str] = mapped_column(Text)
+    issue_keys: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
