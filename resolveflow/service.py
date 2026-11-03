@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from .llm import LLMError
 from .models import Approval, Case, Event, Evidence, Execution, Outbox, PolicyDecision, Proposal, Subcase, now
 from .planner import plan
-from .policy import POLICY_VERSION, evaluate
+from .policy import POLICY_VERSION, evaluate, required_evidence
 from .schemas import ApprovalIn, CaseCreate, EvidenceUpdate
 
 
@@ -99,7 +99,7 @@ def create_case(db: Session, data: CaseCreate) -> Case:
                 source_id=fact.source_id,
             )
         )
-    event(db, item.id, "CASE_CREATED", {"issue_keys": [issue.key for issue in data.issues]})
+    event(db, item.id, "CASE_CREATED", {"issue_keys": [issue.key for issue in data.issues], "request_text": data.request_text})
     return item
 
 
@@ -232,62 +232,164 @@ def approve(db: Session, case_id: str, key: str, data: ApprovalIn) -> Proposal:
     return proposal
 
 
+def case_plan(db: Session, case_id: str) -> dict:
+    """Read-only, explainable snapshot used by both preview and execution."""
+    item = get_case(db, case_id)
+    subcases = list(db.scalars(select(Subcase).where(Subcase.case_id == case_id).order_by(Subcase.key)))
+    proposals = {subcase.key: latest_proposal(db, subcase.id) for subcase in subcases}
+    facts = facts_for(db, case_id)
+    actions = []
+    for subcase in subcases:
+        proposal = proposals[subcase.key]
+        blockers = []
+        if proposal is None:
+            blockers.append("尚未生成候选方案")
+        elif proposal.status == "SUCCEEDED":
+            pass
+        elif proposal.status != "READY":
+            blockers.append(f"方案状态为 {proposal.status}")
+        else:
+            if proposal.evidence_version != item.evidence_version:
+                blockers.append("方案使用的证据版本已过期")
+            for parent in subcase.depends_on:
+                parent_proposal = proposals.get(parent)
+                if parent_proposal is None or parent_proposal.status != "SUCCEEDED":
+                    blockers.append(f"依赖问题 {parent} 尚未完成")
+            decision = db.scalar(select(PolicyDecision).where(PolicyDecision.proposal_id == proposal.id))
+            if decision is None or decision.decision not in ("ALLOW", "REVIEW"):
+                blockers.append("策略未授权执行")
+            elif decision.decision == "REVIEW":
+                approval = db.scalar(select(Approval).where(Approval.proposal_id == proposal.id, Approval.decision == "APPROVE"))
+                if approval is None or approval.proposal_version != proposal.version:
+                    blockers.append("缺少当前动作版本的有效审批")
+        actions.append({
+            "subcase_key": subcase.key,
+            "issue_type": subcase.issue_type,
+            "depends_on": subcase.depends_on,
+            "proposal_id": proposal.id if proposal else None,
+            "proposal_version": proposal.version if proposal else None,
+            "action_type": proposal.action_type if proposal else None,
+            "amount_cents": proposal.amount_cents if proposal else None,
+            "sku": proposal.sku if proposal else None,
+            "status": proposal.status if proposal else "UNPLANNED",
+            "blockers": blockers,
+            "ready_now": bool(proposal and proposal.status == "READY" and not blockers),
+        })
+    global_blockers = []
+    required = {"order_owner", "payment_status", "order_total_cents", "refunded_cents"}
+    if not required.issubset(facts) or facts.get("order_owner") != item.customer_id or facts.get("payment_status") != "PAID":
+        global_blockers.append("执行前业务状态复核失败")
+    active = [p for p in proposals.values() if p and p.status in ("READY", "PENDING_APPROVAL", "QUEUED", "EXECUTING", "SUCCEEDED")]
+    total_refunds = sum(p.amount_cents for p in active if p.action_type == "REFUND")
+    available = max(0, int(facts["order_total_cents"]) - int(facts["refunded_cents"])) if required.issubset(facts) else None
+    if available is not None and total_refunds > available:
+        global_blockers.append("整案累计退款超过可退余额")
+    reships = [p.sku for p in active if p.action_type == "RESHIP"]
+    if len(reships) != len(set(reships)):
+        global_blockers.append("整案存在同一 SKU 的重复补发")
+    refund_skus = {p.sku for p in active if p.action_type == "REFUND" and p.sku}
+    if refund_skus.intersection(reships):
+        global_blockers.append("整案存在同一 SKU 的退款与补发冲突")
+    ready_keys = [action["subcase_key"] for action in actions if action["ready_now"]]
+    return {
+        "case_id": case_id,
+        "case_version": item.version,
+        "evidence_version": item.evidence_version,
+        "actions": actions,
+        "total_refund_cents": total_refunds,
+        "available_refund_cents": available,
+        "global_blockers": global_blockers,
+        "ready_now": ready_keys,
+        "can_execute_now": bool(ready_keys) and not global_blockers,
+    }
+
+
+def closure_proof(db: Session, case_id: str) -> dict:
+    """Derive a verifiable closure checklist from persisted business records."""
+    item = get_case(db, case_id)
+    created = db.scalar(select(Event).where(Event.case_id == case_id, Event.event_type == "CASE_CREATED"))
+    evidence = {row.field: row for row in db.scalars(select(Evidence).where(Evidence.case_id == case_id))}
+    subcases = list(db.scalars(select(Subcase).where(Subcase.case_id == case_id).order_by(Subcase.key)))
+    results = []
+    for subcase in subcases:
+        proposal = latest_proposal(db, subcase.id)
+        decision = db.scalar(select(PolicyDecision).where(PolicyDecision.proposal_id == proposal.id)) if proposal else None
+        approval = db.scalar(select(Approval).where(Approval.proposal_id == proposal.id)) if proposal else None
+        execution = db.scalar(select(Execution).where(Execution.proposal_id == proposal.id)) if proposal else None
+        outbox = db.scalar(select(Outbox).where(Outbox.proposal_id == proposal.id)) if proposal else None
+        refs = []
+        for field in sorted(required_evidence(subcase.issue_type)):
+            row = evidence.get(field)
+            refs.append({
+                "field": field,
+                "evidence_id": row.id if row else None,
+                "source_system": row.source_system if row else None,
+                "source_id": row.source_id if row else None,
+                "version": row.version if row else None,
+                "status": row.status if row else "MISSING",
+                "queried_at": row.queried_at if row else None,
+            })
+        checks = {
+            "subcase_succeeded": subcase.status == "SUCCEEDED",
+            "evidence_valid": bool(proposal) and proposal.evidence_version == item.evidence_version and all(ref["status"] == "VALID" for ref in refs),
+            "policy_authorized": bool(decision) and decision.decision in ("ALLOW", "REVIEW"),
+            "approval_valid": bool(decision) and (decision.decision == "ALLOW" or bool(approval and approval.decision == "APPROVE" and approval.proposal_version == proposal.version)),
+            "outbox_done": bool(outbox) and outbox.status == "DONE",
+            "external_receipt_confirmed": bool(execution) and execution.status == "SUCCEEDED" and bool(execution.external_ref),
+        }
+        results.append({
+            "subcase_key": subcase.key,
+            "issue_type": subcase.issue_type,
+            "status": subcase.status,
+            "proposal_id": proposal.id if proposal else None,
+            "proposal_version": proposal.version if proposal else None,
+            "action_type": proposal.action_type if proposal else None,
+            "amount_cents": proposal.amount_cents if proposal else None,
+            "sku": proposal.sku if proposal else None,
+            "policy_version": decision.policy_version if decision else None,
+            "approval_id": approval.id if approval else None,
+            "external_ref": execution.external_ref if execution else None,
+            "evidence": refs,
+            "checks": checks,
+            "verified": all(checks.values()),
+        })
+    return {
+        "case_id": case_id,
+        "request_text": created.payload.get("request_text") if created else None,
+        "case_status": item.status,
+        "case_version": item.version,
+        "evidence_version": item.evidence_version,
+        "subcases": results,
+        "verified": item.status == "SUCCEEDED" and bool(results) and all(row["verified"] for row in results),
+    }
+
+
 def queue_actions(db: Session, case_id: str, expected_version: int) -> int:
     item = get_case(db, case_id)
     if item.version != expected_version:
         raise DomainError("Case 版本已变化，请刷新后重试")
-    subcases = list(db.scalars(select(Subcase).where(Subcase.case_id == case_id)))
-    proposals = {subcase.key: latest_proposal(db, subcase.id) for subcase in subcases}
-    ready = [
-        (subcase, proposals[subcase.key])
-        for subcase in subcases
-        if proposals[subcase.key]
-        and proposals[subcase.key].status == "READY"
-        and all(proposals[parent] is not None and proposals[parent].status == "SUCCEEDED" for parent in subcase.depends_on)
-    ]
-    if not ready:
+    snapshot = case_plan(db, case_id)
+    if snapshot["global_blockers"]:
+        raise DomainError(snapshot["global_blockers"][0])
+    if not snapshot["ready_now"]:
         raise DomainError("没有可执行动作")
-    facts = facts_for(db, case_id)
-    required = {"order_owner", "payment_status", "order_total_cents", "refunded_cents"}
-    if not required.issubset(facts) or facts["order_owner"] != item.customer_id or facts["payment_status"] != "PAID":
-        raise DomainError("执行前业务状态复核失败")
-    for subcase, proposal in ready:
-        if proposal.evidence_version != item.evidence_version:
-            raise DomainError("方案使用的证据版本已过期")
-        decision = db.scalar(select(PolicyDecision).where(PolicyDecision.proposal_id == proposal.id))
-        if decision.decision == "REVIEW":
-            approval = db.scalar(select(Approval).where(Approval.proposal_id == proposal.id, Approval.decision == "APPROVE"))
-            if approval is None or approval.proposal_version != proposal.version:
-                raise DomainError("缺少当前动作版本的有效审批")
-        elif decision.decision != "ALLOW":
-            raise DomainError("策略未授权执行")
-    active_refunds = sum(
-        proposal.amount_cents
-        for proposal in proposals.values()
-        if proposal and proposal.action_type == "REFUND" and proposal.status in ("READY", "PENDING_APPROVAL", "QUEUED", "EXECUTING", "SUCCEEDED")
-    )
-    if active_refunds > int(facts["order_total_cents"]) - int(facts["refunded_cents"]):
-        raise DomainError("整案累计退款超过可退余额")
-    active_reships = [
-        proposal.sku
-        for proposal in proposals.values()
-        if proposal and proposal.action_type == "RESHIP" and proposal.status in ("READY", "PENDING_APPROVAL", "QUEUED", "EXECUTING", "SUCCEEDED")
-    ]
-    if len(active_reships) != len(set(active_reships)):
-        raise DomainError("整案存在同一 SKU 的重复补发")
-    for subcase, proposal in ready:
+    for key in snapshot["ready_now"]:
+        subcase = get_subcase(db, case_id, key)
+        proposal = latest_proposal(db, subcase.id)
         db.add(Outbox(proposal_id=proposal.id))
         proposal.status = "QUEUED"
         subcase.status = "QUEUED"
         event(db, case_id, "ACTION_QUEUED", {"proposal_id": proposal.id}, subcase.id)
     item.status = "EXECUTING"
-    return len(ready)
+    return len(snapshot["ready_now"])
 
 
 def refresh_case_status(db: Session, item: Case) -> None:
     statuses = [row.status for row in db.scalars(select(Subcase).where(Subcase.case_id == item.id))]
     if statuses and all(status == "SUCCEEDED" for status in statuses):
         if item.status != "NEEDS_REVIEW":
+            if item.status != "SUCCEEDED":
+                event(db, item.id, "CASE_CLOSED", {"subcase_count": len(statuses), "evidence_version": item.evidence_version})
             item.status = "SUCCEEDED"
     elif any(status in ("QUEUED", "EXECUTING") for status in statuses):
         item.status = "EXECUTING"

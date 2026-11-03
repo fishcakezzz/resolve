@@ -4,14 +4,14 @@ ResolveFlow 是面向企业售后与订单异常的 Agent 平台。它将复杂�
 
 ## Agent流程
 
-1. 创建主 Case，拆成多个带依赖关系的 Subcase。
+1. 输入客户自然语言诉求，生成待确认的 Subcase 草稿；检查金额、SKU 和依赖后创建主 Case。
 2. 导入本地模拟的 CRM / OMS / Payment / Logistics / Knowledge 证据，或调用可配置的只读 HTTP 证据适配器；保存来源与版本，标记跨来源冲突。
 3. 使用 LangGraph 分析节点生成候选动作；本地默认使用确定性规划器，可通过环境变量启用兼容 Chat Completions 协议的模型接口。
 4. 用 Policy Engine 校验订单归属、支付状态、重复扣款/缺件/延误证明、退款余额与审批阈值。
 5. 修改证据时使未执行方案和审批失效；人工批准、驳回或修改参数后重新校验。
-6. 执行前检查 Subcase 依赖、整案累计退款和重复补发，再在同一数据库事务中写入 Outbox。
-7. 独立 Worker 幂等执行模拟退款/补发；所有必需 Subcase 成功后主 Case 才结束。
-8. 提供 Case、证据、时间线和执行结果查询接口。
+6. 执行前展示整案计划，检查 Subcase 依赖、累计退款、重复补发及同 SKU 退款与补发冲突，再在同一数据库事务中写入 Outbox。
+7. 独立 Worker 幂等执行模拟退款/补发；所有必需 Subcase 成功后主 Case 才结束，并记录结案事件。
+8. 提供 Case、证据、整案计划、结案证明、时间线和执行结果查询接口。
 
 ## 本地运行
 
@@ -43,6 +43,14 @@ py -3.12 -m venv .venv
 
 ## 演示请求
 
+先调用 `POST /api/case-drafts` 生成待确认草稿：
+
+```json
+{"request_text":"订单少发一件，物流晚到，还重复扣款"}
+```
+
+响应包含 `issues`、每个问题的 `required_evidence` 和 `needs_input`。无模型配置时使用关键词规则；配置模型后使用结构化模型输出。请检查并补齐金额、SKU、依赖关系，再将 `issues` 与原始 `request_text` 一起提交到 `POST /api/cases`。草稿本身不会创建 Case 或执行退款。
+
 `POST /api/cases`：
 
 ```json
@@ -50,6 +58,7 @@ py -3.12 -m venv .venv
   "request_key": "demo-order-1001",
   "customer_id": "customer-1",
   "order_id": "order-1001",
+  "request_text": "订单少发一件，物流晚到，还重复扣款",
   "issues": [
     {"key": "missing", "issue_type": "MISSING_ITEM", "sku": "SKU-1"},
     {"key": "late", "issue_type": "LATE_DELIVERY", "requested_amount_cents": 1000},
@@ -71,8 +80,8 @@ py -3.12 -m venv .venv
 
 1. `POST /api/cases/{case_id}/analyze`，得到方案和策略结果。
 2. 如方案状态为 `PENDING_APPROVAL`，调用 `POST /api/cases/{case_id}/subcases/{key}/approval`。
-3. 从 `GET /api/cases/{case_id}` 读取 `version`，调用 `POST /api/cases/{case_id}/execute`，请求体 `{"expected_case_version": 版本号}`。
-4. Worker 处理后，通过 `GET /api/cases/{case_id}`、`/timeline`、`/executions` 查看结果。
+3. 调用 `GET /api/cases/{case_id}/plan` 查看整案预算、各动作阻塞原因和 `can_execute_now`；从响应读取 `case_version`，调用 `POST /api/cases/{case_id}/execute`，请求体 `{"expected_case_version": 版本号}`。执行入口会复用整案校验。
+4. Worker 处理后，通过 `GET /api/cases/{case_id}`、`/timeline`、`/executions` 查看结果；调用 `GET /api/cases/{case_id}/closure-proof` 核对每个 Subcase 的证据、策略、审批和模拟外部回执。仅全部条件满足时返回 `verified=true`。
 
 ## 测试
 
@@ -80,4 +89,4 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-当前测试覆盖：复杂 Case 结案、证据更新后审批失效、整案退款上限、依赖顺序、请求幂等、Worker 崩溃后恢复、跨来源证据冲突与接口失败降级，以及模型请求格式、异常响应和模型建议越权金额的拦截。
+测试覆盖：自然语言拆案与人工确认、整案计划冲突解释、结案证明、复杂 Case 结案、证据更新后审批失效、整案退款上限、依赖顺序、请求幂等、Worker 崩溃后恢复、跨来源证据冲突与接口失败降级，以及模型请求格式、异常响应和模型建议越权金额的拦截。

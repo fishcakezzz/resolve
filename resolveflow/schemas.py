@@ -24,6 +24,7 @@ class CaseCreate(BaseModel):
     request_key: str = Field(min_length=1, max_length=120)
     customer_id: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
+    request_text: str | None = Field(default=None, max_length=5000)
     issues: list[IssueIn] = Field(min_length=1)
     demo_facts: dict[str, FactIn] = Field(default_factory=dict)
 
@@ -53,6 +54,10 @@ class CaseCreate(BaseModel):
         for key in keys:
             visit(key)
         return self
+
+
+class CaseDraftIn(BaseModel):
+    request_text: str = Field(min_length=1, max_length=5000)
 
 
 class EvidenceUpdate(BaseModel):

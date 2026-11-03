@@ -5,15 +5,21 @@ POLICY_VERSION = "v1"
 REVIEW_THRESHOLD_CENTS = 5000
 
 
+def required_evidence(issue_type: str) -> set[str]:
+    required = {"order_owner", "payment_status", "order_total_cents", "refunded_cents"}
+    issue_fields = {
+        "DUPLICATE_CHARGE": "duplicate_charge_confirmed",
+        "LATE_DELIVERY": "logistics_status",
+        "MISSING_ITEM": "missing_item_confirmed",
+    }
+    if issue_type in issue_fields:
+        required.add(issue_fields[issue_type])
+    return required
+
+
 def evaluate(case: Case, subcase: Subcase, proposal: Proposal, facts: dict) -> tuple[str, list[str]]:
     reasons: list[str] = []
-    required = {"order_owner", "payment_status", "order_total_cents", "refunded_cents"}
-    if subcase.issue_type == "DUPLICATE_CHARGE":
-        required.add("duplicate_charge_confirmed")
-    if subcase.issue_type == "LATE_DELIVERY":
-        required.add("logistics_status")
-    if subcase.issue_type == "MISSING_ITEM":
-        required.add("missing_item_confirmed")
+    required = required_evidence(subcase.issue_type)
 
     missing = sorted(required - facts.keys())
     if missing:

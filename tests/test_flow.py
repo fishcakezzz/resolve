@@ -232,3 +232,83 @@ def test_model_cannot_authorize_refund_above_subcase_amount(monkeypatch):
         proposal = result.json()["subcases"][0]["proposal"]
         assert proposal["status"] == "DENIED"
         assert any("超过该问题申报金额" in reason for reason in proposal["policy"]["reasons"])
+
+
+def test_natural_language_draft_requires_confirmation_and_exposes_missing_inputs(monkeypatch):
+    monkeypatch.delenv("RESOLVE_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("RESOLVE_LLM_CHAT_URL", raising=False)
+    with TestClient(app) as client:
+        draft = client.post("/api/case-drafts", json={"request_text": "订单少发一件，物流晚到，还重复扣款"})
+        assert draft.status_code == 200, draft.text
+        body = draft.json()
+        assert body["confirmation_required"] is True
+        assert {row["issue_type"] for row in body["issues"]} == {"MISSING_ITEM", "LATE_DELIVERY", "DUPLICATE_CHARGE"}
+        assert any(row["needs_input"] for row in body["issues"])
+        assert client.post("/api/case-drafts", json={"request_text": "请帮我看看"}).status_code == 422
+        confirmed = client.post("/api/cases", json={
+            "request_key": "draft-confirm-1", "customer_id": "customer-1", "order_id": "order-1",
+            "request_text": body["request_text"], "issues": body["issues"], "demo_facts": base_facts(),
+        })
+        assert confirmed.status_code == 201, confirmed.text
+        proof = client.get(f"/api/cases/{confirmed.json()['id']}/closure-proof").json()
+        assert proof["request_text"] == body["request_text"]
+        assert proof["verified"] is False
+
+
+def test_plan_explains_whole_case_conflict_and_blocks_execution():
+    with TestClient(app) as client:
+        case = create(client, "plan-conflict-1", [
+            {"key": "late", "issue_type": "LATE_DELIVERY", "requested_amount_cents": 4000},
+            {"key": "double", "issue_type": "DUPLICATE_CHARGE", "requested_amount_cents": 7000},
+        ])
+        case_id = case["id"]
+        client.post(f"/api/cases/{case_id}/analyze")
+        plan = client.get(f"/api/cases/{case_id}/plan").json()
+        assert plan["total_refund_cents"] == 11000
+        assert plan["available_refund_cents"] == 10000
+        assert "整案累计退款超过可退余额" in plan["global_blockers"]
+        assert plan["can_execute_now"] is False
+        approved = client.post(f"/api/cases/{case_id}/subcases/double/approval", json={"approver_id": "manager-1", "decision": "APPROVE"})
+        assert approved.status_code == 200
+        current = client.get(f"/api/cases/{case_id}").json()
+        assert client.post(f"/api/cases/{case_id}/execute", json={"expected_case_version": current["version"]}).status_code == 409
+
+
+def test_closure_proof_requires_every_receipt_and_evidence():
+    with TestClient(app) as client:
+        case = create(client, "proof-1", [
+            {"key": "missing", "issue_type": "MISSING_ITEM", "sku": "SKU-PROOF"},
+            {"key": "late", "issue_type": "LATE_DELIVERY", "requested_amount_cents": 1000},
+        ])
+        case_id = case["id"]
+        analyzed = client.post(f"/api/cases/{case_id}/analyze").json()
+        assert client.get(f"/api/cases/{case_id}/plan").json()["can_execute_now"] is True
+        assert client.post(f"/api/cases/{case_id}/execute", json={"expected_case_version": analyzed["version"]}).status_code == 200
+        assert process_one() is True
+        partial = client.get(f"/api/cases/{case_id}/closure-proof").json()
+        assert partial["verified"] is False
+        assert sum(row["verified"] for row in partial["subcases"]) == 1
+        assert process_one() is True
+        proof = client.get(f"/api/cases/{case_id}/closure-proof").json()
+        assert proof["verified"] is True
+        assert all(row["checks"]["external_receipt_confirmed"] for row in proof["subcases"])
+        assert all(row["evidence"] and all(ref["source_id"] for ref in row["evidence"]) for row in proof["subcases"])
+        assert any(row["event_type"] == "CASE_CLOSED" for row in client.get(f"/api/cases/{case_id}/timeline").json())
+
+
+def test_model_draft_is_schema_checked_before_confirmation(monkeypatch):
+    monkeypatch.setenv("RESOLVE_LLM_BASE_URL", "https://llm.example.test/v1")
+    monkeypatch.delenv("RESOLVE_LLM_CHAT_URL", raising=False)
+    monkeypatch.setenv("RESOLVE_LLM_MODEL", "test-model")
+    monkeypatch.setenv("RESOLVE_LLM_API_KEY", "secret-test-key")
+    content = '{"issues":[{"issue_type":"MISSING_ITEM","requested_amount_cents":0,"sku":"SKU-1","depends_on":[],"reason":"少发商品"},{"issue_type":"LATE_DELIVERY","requested_amount_cents":500,"sku":null,"depends_on":[0],"reason":"到货延误"}]}'
+    response = httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+    monkeypatch.setattr("resolveflow.decomposition._new_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(lambda request: response)))
+    with TestClient(app) as client:
+        draft = client.post("/api/case-drafts", json={"request_text": "少发 SKU-1，之后物流又延误"})
+        assert draft.status_code == 200, draft.text
+        issues = draft.json()["issues"]
+        assert issues[1]["depends_on"] == [issues[0]["key"]]
+        invalid = httpx.Response(200, json={"choices": [{"message": {"content": '{"issues":[{"issue_type":"REFUND","reason":"越权"}]}'}}]})
+        monkeypatch.setattr("resolveflow.decomposition._new_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(lambda request: invalid)))
+        assert client.post("/api/case-drafts", json={"request_text": "退钱"}).status_code == 502

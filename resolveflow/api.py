@@ -6,10 +6,11 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from .db import init_db, transaction
 from .connectors import collect
-from .llm import public_status
+from .decomposition import draft_case
+from .llm import LLMError, public_status
 from .models import Case, Event, Evidence, Execution, Outbox, Proposal, Subcase
-from .schemas import ApprovalIn, CaseCreate, EvidenceUpdate, ExecuteIn
-from .service import DomainError, analyze, approve, case_detail, create_case, get_case, mark_evidence_conflict, queue_actions, update_evidence
+from .schemas import ApprovalIn, CaseCreate, CaseDraftIn, EvidenceUpdate, ExecuteIn
+from .service import DomainError, analyze, approve, case_detail, case_plan, closure_proof, create_case, get_case, mark_evidence_conflict, queue_actions, update_evidence
 
 
 @asynccontextmanager
@@ -45,6 +46,16 @@ def llm_status():
     return public_status()
 
 
+@app.post("/api/case-drafts")
+def post_case_draft(data: CaseDraftIn):
+    try:
+        return draft_case(data.request_text)
+    except ValueError as exc:
+        raise DomainError(str(exc), 422) from exc
+    except LLMError as exc:
+        raise DomainError(str(exc), 502) from exc
+
+
 @app.post("/api/cases", status_code=201)
 def post_case(data: CaseCreate):
     with transaction() as db:
@@ -57,6 +68,18 @@ def post_case(data: CaseCreate):
 def read_case(case_id: str):
     with transaction() as db:
         return case_detail(db, get_case(db, case_id))
+
+
+@app.get("/api/cases/{case_id}/plan")
+def read_case_plan(case_id: str):
+    with transaction() as db:
+        return case_plan(db, case_id)
+
+
+@app.get("/api/cases/{case_id}/closure-proof")
+def read_closure_proof(case_id: str):
+    with transaction() as db:
+        return closure_proof(db, case_id)
 
 
 @app.post("/api/cases/{case_id}/analyze")
