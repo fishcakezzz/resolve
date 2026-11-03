@@ -6,7 +6,7 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from .db import init_db, transaction
 from .connectors import collect
-from .decomposition import draft_case
+from .agents.coordinator import draft as draft_case
 from .llm import LLMError, public_status
 from .models import Case, Event, Evidence, Execution, Outbox, Proposal, Subcase
 from .schemas import ApprovalIn, CaseCreate, CaseDraftIn, EvidenceUpdate, ExecuteIn

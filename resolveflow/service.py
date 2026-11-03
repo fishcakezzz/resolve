@@ -4,9 +4,9 @@ import json
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .agents.graph import analysis_graph
 from .llm import LLMError
 from .models import Approval, Case, Event, Evidence, Execution, Outbox, PolicyDecision, Proposal, Subcase, now
-from .planner import plan
 from .policy import POLICY_VERSION, evaluate, required_evidence
 from .schemas import ApprovalIn, CaseCreate, EvidenceUpdate
 
@@ -157,14 +157,42 @@ def _invalidate_unexecuted_proposals(db: Session, item: Case) -> None:
 def analyze(db: Session, case_id: str) -> Case:
     item = get_case(db, case_id)
     facts = facts_for(db, case_id)
-    for subcase in db.scalars(select(Subcase).where(Subcase.case_id == case_id).order_by(Subcase.key)):
+    subcases = list(db.scalars(select(Subcase).where(Subcase.case_id == case_id).order_by(Subcase.key)))
+    pending = []
+    for subcase in subcases:
         current = latest_proposal(db, subcase.id)
-        if current and current.status != "STALE":
-            continue
-        try:
-            result = plan(subcase.issue_type, subcase.requested_amount_cents, subcase.sku, facts)
-        except LLMError as exc:
-            raise DomainError(str(exc), 502) from exc
+        if current is None or current.status == "STALE":
+            pending.append(subcase)
+    if not pending:
+        return item
+    evidence_refs = {
+        row.field: {"evidence_id": row.id, "version": row.version, "source_system": row.source_system, "source_id": row.source_id}
+        for row in db.scalars(select(Evidence).where(Evidence.case_id == case_id, Evidence.status == "VALID"))
+    }
+    try:
+        agent_result = analysis_graph.invoke({
+            "case_id": case_id,
+            "evidence_version": item.evidence_version,
+            "issues": [
+                {"key": subcase.key, "issue_type": subcase.issue_type, "requested_amount_cents": subcase.requested_amount_cents, "sku": subcase.sku}
+                for subcase in pending
+            ],
+            "facts": facts,
+            "evidence_refs": evidence_refs,
+        })
+    except LLMError as exc:
+        raise DomainError(str(exc), 502) from exc
+    event(db, case_id, "AGENT_COORDINATOR_DISPATCHED", {"issue_keys": [subcase.key for subcase in pending], "task_ids": [task["task_id"] for task in agent_result["tasks"]]})
+    for task in agent_result["tasks"]:
+        event(db, case_id, "AGENT_TASK_DISPATCHED", {"task_id": task["task_id"], "role": task["role"], "issue_keys": task["issue_keys"], "evidence_version": task["evidence_version"]})
+    for role_key in ("fulfillment_result", "payment_result"):
+        result = agent_result[role_key]
+        if result["status"] != "SKIPPED":
+            event(db, case_id, "AGENT_INVESTIGATION_COMPLETED", result)
+    planned_ids = []
+    for subcase in pending:
+        current = latest_proposal(db, subcase.id)
+        result = agent_result["proposals"][subcase.key]
         proposal = Proposal(
             subcase_id=subcase.id,
             version=current.version + 1 if current else 1,
@@ -176,6 +204,7 @@ def analyze(db: Session, case_id: str) -> Case:
         )
         db.add(proposal)
         db.flush()
+        planned_ids.append(proposal.id)
         decision, reasons = evaluate(item, subcase, proposal, facts)
         db.add(
             PolicyDecision(
@@ -189,6 +218,7 @@ def analyze(db: Session, case_id: str) -> Case:
         proposal.status = {"ALLOW": "READY", "REVIEW": "PENDING_APPROVAL", "DENY": "DENIED", "NEEDS_INFO": "NEEDS_INFO"}[decision]
         subcase.status = proposal.status
         event(db, case_id, "PROPOSAL_EVALUATED", {"proposal_id": proposal.id, "decision": decision, "reasons": reasons}, subcase.id)
+    event(db, case_id, "AGENT_PLAN_PROPOSED", {"proposal_ids": planned_ids, "evidence_version": item.evidence_version})
     refresh_case_status(db, item)
     return item
 

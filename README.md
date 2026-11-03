@@ -2,11 +2,13 @@
 
 ResolveFlow 是面向企业售后与订单异常的 Agent 平台。它将复杂诉求拆解为相互关联的 Subcase，围绕证据、策略、审批和执行结果形成可追踪的处理闭环。项目设计见 [PRD](ResolveFlow_PRD.md)。
 
+分析流程按 Case Coordinator、Fulfillment Investigator、Payment Investigator、Resolution Planner 四个角色组织；角色职责、证据权限和调用顺序见 [四角色架构说明](docs/AGENT_ARCHITECTURE.md)。
+
 ## Agent流程
 
 1. 输入客户自然语言诉求，生成待确认的 Subcase 草稿；检查金额、SKU 和依赖后创建主 Case。
 2. 导入本地模拟的 CRM / OMS / Payment / Logistics / Knowledge 证据，或调用可配置的只读 HTTP 证据适配器；保存来源与版本，标记跨来源冲突。
-3. 使用 LangGraph 分析节点生成候选动作；本地默认使用确定性规划器，可通过环境变量启用兼容 Chat Completions 协议的模型接口。
+3. 使用 LangGraph 派发履约和资金调查任务，再由整案方案角色生成候选动作；本地默认使用确定性选择逻辑，可通过环境变量启用兼容 Chat Completions 协议的模型接口。
 4. 用 Policy Engine 校验订单归属、支付状态、重复扣款/缺件/延误证明、退款余额与审批阈值。
 5. 修改证据时使未执行方案和审批失效；人工批准、驳回或修改参数后重新校验。
 6. 执行前展示整案计划，检查 Subcase 依赖、累计退款、重复补发及同 SKU 退款与补发冲突，再在同一数据库事务中写入 Outbox。
@@ -89,4 +91,4 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-测试覆盖：自然语言拆案与人工确认、整案计划冲突解释、结案证明、复杂 Case 结案、证据更新后审批失效、整案退款上限、依赖顺序、请求幂等、Worker 崩溃后恢复、跨来源证据冲突与接口失败降级，以及模型请求格式、异常响应和模型建议越权金额的拦截。
+测试覆盖：四角色任务派发与调查证据权限、自然语言拆案与人工确认、整案计划冲突解释、结案证明、复杂 Case 结案、证据更新后审批失效、整案退款上限、依赖顺序、请求幂等、Worker 崩溃后恢复、跨来源证据冲突与接口失败降级，以及模型请求格式、异常响应和模型建议越权金额的拦截。

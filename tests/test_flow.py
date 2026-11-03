@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -223,8 +224,15 @@ def test_model_cannot_authorize_refund_above_subcase_amount(monkeypatch):
     monkeypatch.delenv("RESOLVE_LLM_CHAT_URL", raising=False)
     monkeypatch.setenv("RESOLVE_LLM_MODEL", "test-model")
     monkeypatch.setenv("RESOLVE_LLM_API_KEY", "secret-test-key")
-    response = httpx.Response(200, json={"choices": [{"message": {"content": '{"action_type":"REFUND","amount_cents":9000,"reason":"模型建议退款"}'}}]})
-    monkeypatch.setattr(llm_module, "_new_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(lambda request: response)))
+    def model_reply(request):
+        user_payload = json.loads(json.loads(request.content)["messages"][1]["content"])
+        if "remaining_fields" in user_payload:
+            content = json.dumps({"field": user_payload["remaining_fields"][0]})
+        else:
+            content = '{"action_type":"REFUND","amount_cents":9000,"reason":"模型建议退款"}'
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    monkeypatch.setattr(llm_module, "_new_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(model_reply)))
     with TestClient(app) as client:
         case = create(client, "over-llm-1", [{"key": "late", "issue_type": "LATE_DELIVERY", "requested_amount_cents": 1000}])
         result = client.post(f"/api/cases/{case['id']}/analyze")
@@ -312,3 +320,52 @@ def test_model_draft_is_schema_checked_before_confirmation(monkeypatch):
         invalid = httpx.Response(200, json={"choices": [{"message": {"content": '{"issues":[{"issue_type":"REFUND","reason":"越权"}]}'}}]})
         monkeypatch.setattr("resolveflow.decomposition._new_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(lambda request: invalid)))
         assert client.post("/api/case-drafts", json={"request_text": "退钱"}).status_code == 502
+
+
+def test_four_role_graph_dispatches_scoped_investigations():
+    with TestClient(app) as client:
+        case = create(client, "agent-roles-1", [
+            {"key": "missing", "issue_type": "MISSING_ITEM", "sku": "SKU-1"},
+            {"key": "double", "issue_type": "DUPLICATE_CHARGE", "requested_amount_cents": 1000},
+        ])
+        case_id = case["id"]
+        analyzed = client.post(f"/api/cases/{case_id}/analyze")
+        assert analyzed.status_code == 200, analyzed.text
+        assert all(row["proposal"] for row in analyzed.json()["subcases"])
+        events = client.get(f"/api/cases/{case_id}/timeline").json()
+        tasks = [row["payload"] for row in events if row["event_type"] == "AGENT_TASK_DISPATCHED"]
+        assert {task["role"] for task in tasks} == {"fulfillment_investigator", "payment_investigator"}
+        results = [row["payload"] for row in events if row["event_type"] == "AGENT_INVESTIGATION_COMPLETED"]
+        assert len(results) == 2
+        for result in results:
+            assert result["steps"] <= 8
+            refs = [ref for finding in result["findings"] for ref in finding["evidence_refs"]]
+            assert refs
+            sources = {ref["source_system"] for ref in refs}
+            if result["role"] == "payment_investigator":
+                assert sources == {"PAYMENT"}
+            else:
+                assert "PAYMENT" not in sources
+
+
+def test_investigator_tool_denies_out_of_scope_fields():
+    from resolveflow.agents.contracts import EvidenceSnapshotTool
+
+    tool = EvidenceSnapshotTool({"payment_status"}, {"payment_status": "PAID", "order_owner": "customer-1"}, {})
+    assert tool.read("payment_status")["value"] == "PAID"
+    with pytest.raises(ValueError):
+        tool.read("order_owner")
+
+
+def test_model_investigator_cannot_read_other_roles_evidence(monkeypatch):
+    monkeypatch.setenv("RESOLVE_LLM_BASE_URL", "https://llm.example.test/v1")
+    monkeypatch.delenv("RESOLVE_LLM_CHAT_URL", raising=False)
+    monkeypatch.setenv("RESOLVE_LLM_MODEL", "test-model")
+    monkeypatch.setenv("RESOLVE_LLM_API_KEY", "secret-test-key")
+    bad = httpx.Response(200, json={"choices": [{"message": {"content": '{"field":"payment_status"}'}}]})
+    monkeypatch.setattr(llm_module, "_new_http_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(lambda request: bad)))
+    with TestClient(app) as client:
+        case = create(client, "agent-scope-1", [{"key": "missing", "issue_type": "MISSING_ITEM", "sku": "SKU-1"}])
+        refused = client.post(f"/api/cases/{case['id']}/analyze")
+        assert refused.status_code == 502
+        assert client.get(f"/api/cases/{case['id']}").json()["subcases"][0]["proposal"] is None

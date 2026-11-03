@@ -1,6 +1,6 @@
 # 大模型 API 接入说明
 
-ResolveFlow 已预留兼容 Chat Completions 的拆案草稿和候选方案接口。模型只生成待确认的 Subcase 草稿与候选动作；订单归属、金额、审批和整案预算仍由 `Policy Engine` 与执行层校验。
+ResolveFlow 已预留兼容 Chat Completions 的拆案草稿、调查字段选择和候选方案接口。模型只生成待确认的 Subcase 草稿、只读查询选择与候选动作；订单归属、金额、审批和整案预算仍由 `Policy Engine` 与执行层校验。
 
 ## 需要提供的信息
 
@@ -29,7 +29,7 @@ RESOLVE_LLM_JSON_MODE=false
 
 ## 请求契约
 
-系统向 Chat Completions 接口发送 `model` 与两条 `messages`。拆案请求的用户消息包含原始诉求；候选方案请求包含当前 Subcase 的类型、申报金额（整数分）、SKU 和已验证证据。可选 JSON 模式会附加 `response_format`。完整请求会在用户提供服务商后按其文档联调。
+系统向 Chat Completions 接口发送 `model` 与两条 `messages`。拆案请求的用户消息包含原始诉求；调查请求包含当前角色、允许查询的剩余字段和已观察到的字段状态；候选方案请求包含当前 Subcase 的类型、申报金额（整数分）、SKU 和已验证证据。可选 JSON 模式会附加 `response_format`。完整请求会在用户提供服务商后按其文档联调。
 
 调用 `POST /api/case-drafts` 时，模型消息 `choices[0].message.content` 的示例：
 
@@ -38,6 +38,8 @@ RESOLVE_LLM_JSON_MODE=false
 ```
 
 问题类型只接受 `MISSING_ITEM`、`LATE_DELIVERY`、`DUPLICATE_CHARGE`；依赖使用前序问题的零基索引。响应经过 Schema 和依赖校验后只作为草稿，需人工确认并调用 `POST /api/cases` 才会持久化。
+
+调用 `POST /api/cases/{id}/analyze` 时，履约和资金调查角色会逐步选择允许的只读证据字段，模型输出格式为 `{"field":"payment_status"}`。每个角色只能选择任务给出的 `remaining_fields`；越权字段或无效格式使本次分析失败，不会创建候选方案。未配置模型时按固定字段顺序读取已保存的证据快照。当前调查工具不会直接发起新的外部 HTTP 查询，外部证据仍通过 `/collect-evidence` 导入。
 
 调用 `POST /api/cases/{id}/analyze` 时，模型消息 `choices[0].message.content` 必须是纯 JSON 对象，例如：
 
@@ -50,6 +52,6 @@ RESOLVE_LLM_JSON_MODE=false
 ## 接入验证
 
 1. 填写配置后启动 API，确认 `GET /api/llm/status` 返回 `remote` 和正确模型名。
-2. 调用 `POST /api/case-drafts` 检查多诉求拆案，确认草稿后创建一个演示 Case，再调用 `POST /api/cases/{id}/analyze`。
+2. 调用 `POST /api/case-drafts` 检查多诉求拆案，确认草稿后创建一个演示 Case，再调用 `POST /api/cases/{id}/analyze`。配置模型后，一次分析可能触发多次调查字段选择请求及候选方案请求。
 3. 检查候选方案、Policy Decision 和时间线；再验证金额越界、模型超时、非法响应时没有动作进入 Outbox。
 4. 执行 `python -m pytest -q`。现有测试使用模拟 HTTP 服务，不消耗真实模型额度。
